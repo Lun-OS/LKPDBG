@@ -1,0 +1,183 @@
+name: Build KPM Hidden Driver
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: 'Clean previous artifacts before build'
+        type: boolean
+        default: true
+      no_protect:
+        description: 'Skip hardening (keep symbols, for debugging)'
+        type: boolean
+        default: false
+      protect_plain:
+        description: 'Comma-separated plaintext tokens to block (e.g. "69.184.91.135,10012")'
+        type: string
+        default: ''
+      batch_single:
+        description: 'Build mem/gyro/touch single-feature variants instead of all'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Install ARM GNU Toolchain 15.3.Rel1
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_VERSION="15.3.rel1"
+          TARBALL="arm-gnu-toolchain-${TOOLCHAIN_VERSION}-x86_64-aarch64-none-elf.tar.xz"
+          URL="https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/${TOOLCHAIN_VERSION}/${TARBALL}"
+
+          echo "Downloading: $URL"
+          wget -q --show-progress "$URL"
+
+          mkdir -p "$HOME/toolchain"
+          tar -xJf "$TARBALL" -C "$HOME/toolchain" --strip-components=1
+
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+          echo "Toolchain installed at $HOME/toolchain"
+
+      - name: Verify toolchain version
+        run: |
+          aarch64-none-elf-gcc --version
+          aarch64-none-elf-ld --version | head -1
+          # 应当输出：Arm GNU Toolchain 15.3.Rel1 (Build arm-15.149) 15.3.1
+          # binutils：2.45.1.20260126
+
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make python3 wget
+
+          # 创建 python -> python3 软链，兼容可能硬编码 `python` 的脚本
+          if ! command -v python >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v python3)" /usr/local/bin/python
+          fi
+          python --version
+          python3 --version
+
+      - name: Parse module version
+        id: version
+        run: |
+          VERSION_HEADER="LH_Dr_KPM/LH_version.h"
+          if [ -f "$VERSION_HEADER" ]; then
+            MAJ=$(grep -oP 'LH_VERSION_MAJOR\s+\K\d+' "$VERSION_HEADER" || true)
+            MIN=$(grep -oP 'LH_VERSION_MINOR\s+\K\d+' "$VERSION_HEADER" || true)
+            PAT=$(grep -oP 'LH_VERSION_PATCH\s+\K\d+' "$VERSION_HEADER" || true)
+            if [ -n "$MAJ" ] && [ -n "$MIN" ] && [ -n "$PAT" ]; then
+              echo "VERSION=${MAJ}.${MIN}.${PAT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "VERSION=1.6.1" >> "$GITHUB_OUTPUT"
+          echo "::warning::无法从 LH_version.h 解析版本号，回退到 1.6.1"
+
+      - name: Clean previous artifacts
+        if: ${{ inputs.clean }}
+        run: |
+          rm -f LH_Dr_KPM/*.o LH_Dr_KPM/*.kpm
+          rm -rf bin
+
+      - name: Ensure bin directory exists
+        run: mkdir -p bin
+
+      - name: Build KPM variants
+        shell: bash
+        env:
+          TARGET_COMPILE: aarch64-none-elf-
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          NO_PROTECT: ${{ inputs.no_protect }}
+          PROTECT_PLAIN: ${{ inputs.protect_plain }}
+          BATCH_SINGLE: ${{ inputs.batch_single }}
+        run: |
+          set -euo pipefail
+
+          declare -A FEAT_SUFFIX=( [all]="" [mem]="_mem" [gyro]="_gyro" [touch]="_touch" )
+          declare -A FEAT_ARGS=(
+            [all]=""
+            [mem]="FEATURE_MEM=1 FEATURE_GYRO=0 FEATURE_TOUCH=0"
+            [gyro]="FEATURE_MEM=0 FEATURE_GYRO=1 FEATURE_TOUCH=0"
+            [touch]="FEATURE_MEM=0 FEATURE_GYRO=0 FEATURE_TOUCH=1"
+          )
+          if [[ "${BATCH_SINGLE:-false}" == "true" ]]; then
+            FEATURE_LIST=(mem gyro touch)
+          else
+            FEATURE_LIST=(all)
+          fi
+
+          PROTECT_SCRIPT="KernelPatch_temp/tools/kpm_protect.py"
+          ENCSTR_SCRIPT="KernelPatch_temp/tools/encstr.py"
+          ENC_MANIFEST="LH_Dr_KPM/LH_main.enc"
+          ENC_HEADER="LH_Dr_KPM/encstr_autogen.h"
+
+          for feat in "${FEATURE_LIST[@]}"; do
+            SUFFIX="${FEAT_SUFFIX[$feat]}"
+            FEAT_ARGS_STR="${FEAT_ARGS[$feat]}"
+
+            for variant in debug release; do
+              echo "::group::Build ${variant} (feature: ${feat:-all})"
+
+              rm -f LH_Dr_KPM/*.o LH_Dr_KPM/*.kpm
+
+              if [[ "${NO_PROTECT:-false}" != "true" ]] \
+                 && [ -f "$ENC_MANIFEST" ] && [ -f "$ENCSTR_SCRIPT" ]; then
+                echo "Generating encrypted strings header..."
+                python3 "$ENCSTR_SCRIPT" --in "$ENC_MANIFEST" --out "$ENC_HEADER"
+              fi
+
+              MAKE_ARGS=("TARGET_COMPILE=${TARGET_COMPILE}")
+              if [ "$variant" = "release" ]; then
+                MAKE_ARGS+=("RELEASE=1")
+              else
+                MAKE_ARGS+=("DEBUG=1")
+              fi
+              if [ -n "$FEAT_ARGS_STR" ]; then
+                # shellcheck disable=SC2206
+                MAKE_ARGS+=($FEAT_ARGS_STR)
+              fi
+
+              echo "Running: make ${MAKE_ARGS[*]}"
+              ( cd LH_Dr_KPM && make "${MAKE_ARGS[@]}" )
+
+              if [ ! -f "LH_Dr_KPM/LH_main.kpm" ]; then
+                echo "::error::LH_main.kpm not found after ${variant} build"
+                exit 1
+              fi
+
+              if [[ "${NO_PROTECT:-false}" != "true" ]] && [ -f "$PROTECT_SCRIPT" ]; then
+                echo "Hardening ${variant} variant..."
+                PROTECT_ARGS=(--syms --zero-comment -f LH_Dr_KPM/LH_main.kpm -o LH_Dr_KPM/LH_main.kpm)
+                if [ -n "${PROTECT_PLAIN:-}" ]; then
+                  IFS=',' read -ra TOKENS <<< "$PROTECT_PLAIN"
+                  PROTECT_ARGS+=(--check-plain "${TOKENS[@]}")
+                  echo "Leak gate tokens: ${TOKENS[*]}"
+                fi
+                python3 "$PROTECT_SCRIPT" "${PROTECT_ARGS[@]}"
+              else
+                echo "::warning::Hardening SKIPPED (${variant})"
+              fi
+
+              OUT="bin/LH_${VERSION}_${variant}${SUFFIX}.kpm"
+              cp LH_Dr_KPM/LH_main.kpm "$OUT"
+              echo "Output: $OUT ($(stat -c%s "$OUT") bytes)"
+
+              rm -f LH_Dr_KPM/*.o LH_Dr_KPM/*.kpm
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Upload KPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpm-builds-${{ steps.version.outputs.VERSION }}
+          path: bin/LH_*.kpm
+          if-no-files-found: error
